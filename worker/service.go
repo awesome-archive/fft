@@ -1,7 +1,13 @@
 package worker
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"strconv"
 	"time"
@@ -11,9 +17,11 @@ import (
 )
 
 type Options struct {
-	ServerAddr     string
-	BindAddr       string
-	AdvicePublicIP string
+	ServerAddr         string
+	BindAddr           string
+	AdvicePublicIP     string
+	RateKB             int // xx KB/s
+	MaxTrafficMBPerDay int // xx MB, 0 is no limit
 
 	LogFile    string
 	LogLevel   string
@@ -24,15 +32,28 @@ func (op *Options) Check() error {
 	if op.LogMaxDays <= 0 {
 		op.LogMaxDays = 3
 	}
+	if op.RateKB < 50 {
+		return fmt.Errorf("rate should be greater than 50KB")
+	}
+	if op.MaxTrafficMBPerDay < 128 && op.MaxTrafficMBPerDay != 0 {
+		return fmt.Errorf("max_traffic_per_day should be greater than 128MB")
+	}
 	return nil
 }
 
 type Service struct {
-	serverAddr     string
-	advicePublicIP string
+	serverAddr         string
+	advicePublicIP     string
+	rateKB             int
+	maxTrafficMBPerDay int
 
-	l        net.Listener
-	matchCtl *MatchController
+	l              net.Listener
+	matchCtl       *MatchController
+	register       *Register
+	trafficLimiter *TrafficLimiter
+	tlsConfig      *tls.Config
+
+	stopCh chan struct{}
 }
 
 func NewService(options Options) (*Service, error) {
@@ -52,41 +73,60 @@ func NewService(options Options) (*Service, error) {
 	}
 	log.Info("fftw listen on: %s", l.Addr().String())
 
-	return &Service{
-		serverAddr:     options.ServerAddr,
-		advicePublicIP: options.AdvicePublicIP,
+	_, portStr, err := net.SplitHostPort(l.Addr().String())
+	if err != nil {
+		return nil, fmt.Errorf("get bind port error, bind address: %v", l.Addr().String())
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("get bind port error: %v", err)
+	}
 
-		l:        l,
-		matchCtl: NewMatchController(),
-	}, nil
+	register, err := NewRegister(int64(port), options.AdvicePublicIP, options.ServerAddr)
+	if err != nil {
+		return nil, fmt.Errorf("new register error: %v", err)
+	}
+
+	svc := &Service{
+		serverAddr:         options.ServerAddr,
+		advicePublicIP:     options.AdvicePublicIP,
+		rateKB:             options.RateKB,
+		maxTrafficMBPerDay: options.MaxTrafficMBPerDay,
+
+		l:         l,
+		register:  register,
+		tlsConfig: generateTLSConfig(),
+
+		stopCh: make(chan struct{}),
+	}
+
+	svc.trafficLimiter = NewTrafficLimiter(uint64(options.MaxTrafficMBPerDay*1024*1024), func() {
+		svc.register.Close()
+		log.Info("reach traffic limit %dMB one day, unregister from server", options.MaxTrafficMBPerDay)
+	}, func() {
+		svc.register.Reset()
+		go svc.register.RunKeepAlive()
+		log.Info("restore from traffic limit since it's a new day")
+	})
+
+	svc.matchCtl = NewMatchController(options.RateKB*1024, func(n int) {
+		svc.trafficLimiter.AddCount(uint64(n))
+	})
+	return svc, nil
 }
 
 func (svc *Service) Run() error {
 	go svc.worker()
+	go svc.trafficLimiter.Run()
 
-	// connect to server
-	conn, err := net.Dial("tcp", svc.serverAddr)
-	if err != nil {
-		return err
-	}
-
-	_, portStr, err := net.SplitHostPort(svc.l.Addr().String())
-	if err != nil {
-		return fmt.Errorf("get bind port error, bind address: %v", svc.l.Addr().String())
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("get bind port error")
-	}
-
-	register := NewRegister(int64(port), svc.advicePublicIP, svc.serverAddr)
-	err = register.Register(conn)
+	err := svc.register.Register()
 	if err != nil {
 		return fmt.Errorf("register worker to server error: %v", err)
 	}
 	log.Info("register to server success")
 
-	register.RunKeepAlive(conn)
+	svc.register.RunKeepAlive()
+	<-svc.stopCh
 	return nil
 }
 
@@ -96,6 +136,7 @@ func (svc *Service) worker() error {
 		if err != nil {
 			return err
 		}
+		conn = tls.Server(conn, svc.tlsConfig)
 		go svc.handleConn(conn)
 	}
 }
@@ -141,4 +182,25 @@ func (svc *Service) handleConn(conn net.Conn) {
 		conn.Close()
 		return
 	}
+}
+
+// Setup a bare-bones TLS config for the server
+func generateTLSConfig() *tls.Config {
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		panic(err)
+	}
+	template := x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{tlsCert}}
 }
